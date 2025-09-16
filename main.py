@@ -4,6 +4,7 @@ import os, json
 from datetime import datetime, timedelta, timezone
 from flask import Flask
 import threading
+import asyncio
 
 # ===================== CONFIG =====================
 DATA_FILE = "trades.json"
@@ -39,7 +40,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=["!", "/"], intents=intents)
 
-# ===================== KEEP ALIVE =====================
+# ===================== KEEP ALIVE (Optional for Background Worker) =====================
 app = Flask("")
 
 @app.route("/")
@@ -50,11 +51,13 @@ def run_web():
     app.run(host="0.0.0.0", port=8000)
 
 def keep_alive():
-    t = threading.Thread(target=run_web)
+    t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
 # ===================== UTILS =====================
 def compute_rr(entry, sl, tp):
+    if sl is None or tp is None:
+        return 0.0
     risk = abs(entry - sl)
     reward = abs(tp - entry)
     if risk == 0: return 0.0
@@ -92,137 +95,99 @@ async def ping(ctx):
     await ctx.send("🏓 Boing! I'm alive and kickin'!")
 
 @bot.command()
-async def tradehelp(ctx):
-    text = """
-🎉 **TradeBot — Your Trading Sidekick!**
-Use `!` or `/` as prefix.
-
-➕ **Log a Trade**
-!trade or /trade <pair> <buy/sell> <entry> <sl> <tp> <tp/sl/none>
-
-ℹ️ **Get Help**
-!tradehelp or /tradehelp → Show this command list
-
-📊 **Check Your Game**
-!stats or /stats → All-time glory
-!dailystats or /dailystats / !weeklystats or /weeklystats / !monthlystats or /monthlystats
-
-🏆 **Show Off**
-!leaderboard or /leaderboard → Top traders
-!besttrade or /besttrade / !worsttrade or /worsttrade
-!streak or /streak → Win streak vibes
-
-🛠 **Tweak It**
-!removelasttrade or /removelasttrade
-!resetstats or /resetstats (yours) or !resetstats all or /resetstats all (admin only)
-
-📅 **Time Travel**
-!calendar or /calendar → Trade timeline
-"""
-    await ctx.send(text)
-
-@bot.command()
-async def trade(ctx, pair: str, direction: str, entry: float, sl: float, tp: float, result: str):
-    direction = direction.lower()
-    result = result.lower()
-    valid_results = {"tp", "sl", "none"}
-    if direction not in ("buy", "sell") or result not in valid_results:
-        await ctx.send("❌ Whoops! Try: !trade or /trade xauusd buy 3300 3290 3330 tp/sl/none")
-        return
-
-    rr_val = compute_rr(entry, sl, tp)
-    rr_signed = rr_val if result == "tp" else -rr_val if result == "sl" else 0.0
-
-    record = {
-        "pair": pair,
-        "dir": direction,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "result": result,
-        "rr": rr_signed,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-    user_id = str(ctx.author.id)
-    log_trade(user_id, record)
-
-    await ctx.send(f"🎉 Nice one! {pair.upper()} {direction.upper()} is logged 🎉 RR: {rr_signed:+.2f} 🚀 "
-                   f"(TP {'reached' if result == 'tp' else 'not reached' if result == 'none' else 'missed'}!)")
-
-def build_stats_table(ctx, trades, title):
-    total, wins, losses, neutral, total_rr, avg_rr, win_rate = stats_summary(trades)
-    table = f"**{ctx.author.name} — {title}**\n" \
-            f"| Metric         | Value         |\n" \
-            f"|---------------:|---------------|\n" \
-            f"| Trades         | {total}        |\n" \
-            f"| Wins           | {wins}         |\n" \
-            f"| Losses         | {losses}       |\n" \
-            f"| Neutral        | {neutral}      |\n" \
-            f"| Total RR       | {total_rr:+.2f}    |\n" \
-            f"| Avg RR         | {avg_rr:.2f}   |\n" \
-            f"| Win Rate       | {win_rate:.1f}%  |"
-    return table
+async def trade(ctx, symbol, action, entry, sl=None, tp=None, action_type="none"):
+    try:
+        user_id = str(ctx.author.id)
+        entry = float(entry)
+        sl = float(sl) if sl is not None else None
+        tp = float(tp) if tp is not None else None
+        
+        if sl is None and tp is None:
+            await ctx.send("❌ Please provide at least a stop-loss (SL) or take-profit (TP). Use: !trade <symbol> <buy/sell> <entry> [sl] [tp] [tp/sl/none]")
+            return
+        
+        timestamp = datetime.now(timezone.utc).isoformat()
+        rr = compute_rr(entry, sl, tp)
+        record = {
+            "pair": symbol.lower(),
+            "dir": action.lower(),
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "result": action_type.lower(),
+            "rr": rr,
+            "timestamp": timestamp
+        }
+        log_trade(user_id, record)
+        
+        if action_type.lower() == "tp":
+            result_msg = "TP reached!"
+        elif action_type.lower() == "sl":
+            result_msg = "SL hit!"
+        else:
+            result_msg = "Pending"
+            
+        msg = f"🎉 Nice one! {symbol.upper()} {action.upper()} is logged 🎉 RR: +{rr:.2f} 🚀 ({result_msg})"
+        await ctx.send(msg)
+    except ValueError:
+        await ctx.send("❌ Error: Entry, SL, and TP must be numbers. Use: !trade <symbol> <buy/sell> <entry> [sl] [tp] [tp/sl/none]")
+    except Exception as e:
+        await ctx.send(f"❌ Unexpected error in trade command: {str(e)}")
 
 @bot.command()
 async def stats(ctx):
     user_id = str(ctx.author.id)
     trades = trade_data.get(user_id, {}).get("trades", [])
     if not trades:
-        await ctx.send("📊 No trades yet, champ! Start logging!")
+        await ctx.send("📊 No trades yet, champ!")
         return
-    await ctx.send(build_stats_table(ctx, trades, "Lifetime Stats"))
+    total, wins, losses, neutral, total_rr, avg_rr, win_rate = stats_summary(trades)
+    await ctx.send(f"**{ctx.author.name} — Lifetime Stats** | Trades: {total} | Wins: {wins} | Losses: {losses} | Neutral: {neutral} | Total RR: {total_rr:+.2f} | Avg RR: {avg_rr:.2f} | Win Rate: {win_rate:.1f}%")
 
 @bot.command()
 async def dailystats(ctx):
     user_id = str(ctx.author.id)
     trades = filter_trades(trade_data.get(user_id, {}).get("trades", []), "daily")
     if not trades:
-        await ctx.send("📊 No trades in the last 24h, huh?")
+        await ctx.send("📅 No trades in the last 24 hours!")
         return
-    await ctx.send(build_stats_table(ctx, trades, "Daily Stats"))
+    total, wins, losses, neutral, total_rr, avg_rr, win_rate = stats_summary(trades)
+    await ctx.send(f"**{ctx.author.name} — Daily Stats** | Trades: {total} | Wins: {wins} | Losses: {losses} | Neutral: {neutral} | Total RR: {total_rr:+.2f} | Avg RR: {avg_rr:.2f} | Win Rate: {win_rate:.1f}%")
 
 @bot.command()
 async def weeklystats(ctx):
     user_id = str(ctx.author.id)
     trades = filter_trades(trade_data.get(user_id, {}).get("trades", []), "weekly")
     if not trades:
-        await ctx.send("📊 Quiet week? No trades yet!")
+        await ctx.send("📅 No trades in the last 7 days!")
         return
-    await ctx.send(build_stats_table(ctx, trades, "Weekly Stats"))
+    total, wins, losses, neutral, total_rr, avg_rr, win_rate = stats_summary(trades)
+    await ctx.send(f"**{ctx.author.name} — Weekly Stats** | Trades: {total} | Wins: {wins} | Losses: {losses} | Neutral: {neutral} | Total RR: {total_rr:+.2f} | Avg RR: {avg_rr:.2f} | Win Rate: {win_rate:.1f}%")
 
 @bot.command()
 async def monthlystats(ctx):
     user_id = str(ctx.author.id)
     trades = filter_trades(trade_data.get(user_id, {}).get("trades", []), "monthly")
     if not trades:
-        await ctx.send("📊 No trades this month, time to shine!")
+        await ctx.send("📅 No trades this month!")
         return
-    await ctx.send(build_stats_table(ctx, trades, "Monthly Stats"))
+    total, wins, losses, neutral, total_rr, avg_rr, win_rate = stats_summary(trades)
+    await ctx.send(f"**{ctx.author.name} — Monthly Stats** | Trades: {total} | Wins: {wins} | Losses: {losses} | Neutral: {neutral} | Total RR: {total_rr:+.2f} | Avg RR: {avg_rr:.2f} | Win Rate: {win_rate:.1f}%")
 
 @bot.command()
 async def leaderboard(ctx):
-    scores = []
-    for uid, udata in trade_data.items():
-        total_rr = sum(t["rr"] for t in udata["trades"])
-        scores.append((uid, total_rr))
-    scores.sort(key=lambda x: x[1], reverse=True)
-    text = "🏆 **Leaderboard of Legends!**\n"
-    for i, (uid, rr) in enumerate(scores[:10], 1):
-        user = await bot.fetch_user(int(uid))
-        trophy = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🎖️"
-        text += f"{i}. {trophy} {user.name} — {rr:+.2f} RR\n"
-    await ctx.send(text)
-
-@bot.command()
-async def removelasttrade(ctx):
-    user_id = str(ctx.author.id)
-    trades = trade_data.get(user_id, {}).get("trades", [])
-    if not trades:
-        await ctx.send("❌ No trades to zap! Log one first.")
+    all_trades = []
+    for uid in trade_data:
+        all_trades.extend(trade_data[uid]["trades"])
+    if not all_trades:
+        await ctx.send("🏆 No trades to rank!")
         return
-    last = trades.pop()
-    save_data(trade_data)
-    await ctx.send(f"⏪ Trade removed! {last['pair']} {last['dir']} RR {last['rr']:+.2f}\n✓ Data saved.")
+    sorted_trades = sorted(all_trades, key=lambda t: t["rr"], reverse=True)[:5]
+    text = "🏆 **Leaderboard of Legends**\n"
+    for i, t in enumerate(sorted_trades, 1):
+        user = bot.get_user(int(t.get("user_id", "0"))) or "Unknown"
+        text += f"{i}. {user.name} - {t['pair'].upper()} {t['dir'].upper()} RR: {t['rr']:+.2f}\n"
+    await ctx.send(text)
 
 @bot.command()
 async def besttrade(ctx):
@@ -293,10 +258,23 @@ async def calendar(ctx):
         text += f"On {d}, you rocked {len(ts)} trades with a total RR of {total_rr:+.2f}!\n"
     await ctx.send(text)
 
+# ===================== GLOBAL ERROR HANDLING =====================
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ Missing required argument. Check your command syntax!")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Invalid argument. Ensure numbers are used where required!")
+    elif isinstance(error, commands.CommandNotFound):
+        await ctx.send("❌ Unknown command. Type !help for available commands!")
+    else:
+        await ctx.send(f"❌ An unexpected error occurred: {str(error)}")
+        print(f"Error: {str(error)}")  # Log to console for debugging
+
 # ===================== RUN =====================
 if __name__ == "__main__":
     if not TOKEN:
-        print("❌ Set DISCORD_TOKEN in Replit Secrets.")
+        print("❌ Set DISCORD_TOKEN in environment variables.")
     else:
         keep_alive()
         bot.run(TOKEN)
